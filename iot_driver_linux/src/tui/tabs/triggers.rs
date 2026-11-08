@@ -920,7 +920,11 @@ impl App {
 
         // The Fn layer is a separate store, so it is always its own read.
         let fn_action = kb
-            .and_then(|kb| kb.get_fn_keymatrix(kb.active_profile(), 0, 8).ok())
+            .and_then(|kb| {
+                kb.active_fn_target()
+                    .and_then(|target| kb.get_fn_keymatrix(target, 8))
+                    .ok()
+            })
             .and_then(|m| {
                 m.get(key_index * 4..key_index * 4 + 4)
                     .map(|s| KeyAction::from_config_bytes([s[0], s[1], s[2], s[3]]))
@@ -1093,11 +1097,7 @@ impl App {
                                         bytes,
                                         true,
                                     ),
-                                    None => keyboard.set_fn_config(
-                                        keyboard.active_profile(),
-                                        key,
-                                        bytes,
-                                    ),
+                                    None => keyboard.set_fn_config(key, bytes),
                                 };
                                 if let Err(e) = res {
                                     extra.push(format!("output {layer}: {e}"));

@@ -668,7 +668,7 @@ impl App {
         self.loading.key_mapping = LoadState::Loading;
         let tx = self.gen_sender();
         tokio::spawn(async move {
-            match keymap::load_key_rows(&keyboard, 0) {
+            match keymap::load_key_rows(&keyboard, None) {
                 Ok(rows) => tx.send(AsyncResult::KeyRows(Ok(rows))),
                 Err(e) => tx.send(AsyncResult::KeyRows(Err(e.to_string()))),
             }

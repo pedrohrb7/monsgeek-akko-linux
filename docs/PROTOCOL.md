@@ -478,8 +478,34 @@ Clear this context after receiving a response to avoid stale matches.
 A key's behaviour spans **two per-key tables**, plus a separate Fn table:
 
 - **Keymatrix** (`SET_KEYMATRIX 0x0A` / `GET_KEYMATRIX 0x8A`): 4 layers × keys × 4 bytes
-  `[type,b1,b2,b3]`. **Fn is a separate table** (`SET_FN 0x10` / `GET_FN 0x90`, keyed by
-  OS: 0=Win, 1=Mac).
+  `[type,b1,b2,b3]`. **Fn is a separate table** (`SET_FN 0x10` / `GET_FN 0x90`), one
+  per **(OS, Fn layer)** pair - not per profile. The live pair is in `GET_KBOPTION`
+  (0x89): response byte 1 is the OS (0 Win, 1 Mac, 2 iOS, 3 Android) and byte 2 is
+  `fnIndex`, the Fn layer (the device DB's `fnSysLayer` gives how many per OS, 2 on
+  the FUN60 PRO). `GET_FN`/`SET_FN` carry them as `[sys, fn_layer, ...]`; the byte
+  this project once filled with the profile is `fnIndex` in the official app.
+  The official app never writes the OS byte (its `setKBOption` only sets bytes 2-5),
+  so the OS can only be switched on the keyboard itself. On the FUN60 PRO (ID 2600)
+  the factory Fn layer binds `Fn+O` to `OS: Cycle`: a **~3 s hold** cycles the OS;
+  a quick tap does nothing observable. The Fn layer (`fnIndex`) is flipped by the
+  factory `Fn+RAlt`, whose config `[0x0A, 0x0B, 0, 0]` this project decodes as
+  "NKRO Toggle" from the M1 V5 firmware; on this board it switches the Fn layer.
+  Symptom of being stuck in Mac mode:
+  `Fn+1..4` give brightness/Mission-Control actions instead of `F1..F4`.
+
+  **Writing the Fn table on RY5088** (verified on a FUN60 PRO, firmware 0x0402):
+  - Single-key `SET_FN` `[0x10, sys, fn_layer, key, 0, 0, 0, chk, cfg×4]` keeps only
+    the **most recent** edit: each one rebuilds the table from the factory default
+    plus that key, so Fn+W then Fn+A leaves only Fn+A (physically and on read-back).
+    The official app uses this path anyway (`canControlSingleKey`), which is why
+    adding several Fn shortcuts there fails the same way.
+  - Whole-table `SET_FN` (`CommonKBRY5088._setFnKeyConfig`): 10 reports
+    `[0x10, sys, fn_layer, 0xFF, page, len, last, chk, payload×56]`. Pages 0-8 carry
+    56 bytes each (9 × 56 = 504 = 126 positions × 4, same order as `GET_FN`); page 9
+    is the commit with `len = 0`, `last = 1`. All edits survive.
+  - After the commit the firmware writes flash; `GET_FN` returns stale data for a
+    short while (a read straight after differed in ~30 positions), so poll the
+    read-back instead of reading once.
 - **Magnetism** (`SET_MULTI_MAGNETISM 0x65` / `GET_MULTI_MAGNETISM 0xE5`): per-key by
   sub-command — `0` press, `1` lift, `2/3` RT, `4` DKS travel, `5` ModTap time, `6`
   bottom deadzone, **`7` KEY_MODE**, **`8` DKS binding-rows (SET)**, **`9` SnapTap

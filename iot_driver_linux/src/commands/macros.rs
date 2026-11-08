@@ -1,10 +1,11 @@
 //! Macro command handlers.
 
 use super::CommandResult;
+use iot_driver::keymap::KeyTable;
 use iot_driver::macro_seq::MacroSeq;
 use iot_driver::protocol::hid;
 use monsgeek_keyboard::{KeyboardInterface, parse_macro_events};
-use monsgeek_transport::protocol::{HidUsage, Layer, MacroSlot, MatrixPos, matrix};
+use monsgeek_transport::protocol::{HidUsage, Layer, MacroSlot};
 
 /// Get macro for a key
 pub fn get_macro(keyboard: &KeyboardInterface, key: &str) -> CommandResult {
@@ -156,30 +157,26 @@ pub fn assign_macro(
         }
     };
 
-    // Resolve key name to matrix index
-    let key_index = if let Ok(idx) = key.parse::<u8>() {
-        MatrixPos::new(idx)
-    } else if let Some(pos) = matrix::key_index_from_name(key) {
-        pos
-    } else {
-        eprintln!(
-            "Unknown key name: \"{key}\". Use a matrix index number or key name like F3, Esc, etc."
-        );
-        return Ok(());
+    let table = KeyTable::from_device(keyboard);
+    let key_index = match table.resolve(key) {
+        Ok(pos) => pos,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(());
+        }
     };
 
-    let key_name = keyboard.matrix_key_name(key_index.into());
     let layer = if fn_layer { Layer::Fn } else { Layer::Base };
-    let prefix = if fn_layer { "Fn+" } else { "" };
+    let label = table.ref_label(key_index, layer);
     println!(
-        "Assigning macro {macro_index} to {prefix}{key_name} (index {})...",
+        "Assigning macro {macro_index} to {label} (index {})...",
         key_index.get()
     );
 
     // macro_type 0 = repeat by count
     let result = keyboard.assign_macro_to_key(layer, key_index.get(), macro_index, 0);
     match result {
-        Ok(()) => println!("Macro {macro_index} assigned to {prefix}{key_name}"),
+        Ok(()) => println!("Macro {macro_index} assigned to {label}"),
         Err(e) => eprintln!("Failed to assign macro: {e}"),
     }
     Ok(())

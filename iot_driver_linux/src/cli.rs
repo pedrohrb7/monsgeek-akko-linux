@@ -381,9 +381,9 @@ pub enum Commands {
         /// Prefix with ! to exclude; #N is a matrix position; N..M a range.
         #[arg(short, long, value_delimiter = ',', value_name = "SEL")]
         keys: Vec<iot_driver::keyclass::KeySelector>,
-        /// OS variant of the Fn layer
-        #[arg(long, value_enum, default_value_t = SysArg::Win)]
-        sys: SysArg,
+        /// OS variant of the Fn layer (default: the one the keyboard is running)
+        #[arg(long, value_enum)]
+        sys: Option<SysArg>,
         /// Append the raw 4-byte config to each row
         #[arg(long)]
         raw: bool,

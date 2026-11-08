@@ -15,7 +15,7 @@ We developed two approaches to get it working on Linux:
 
 ```bash
 # Copy the udev rules file
-sudo cp 99-monsgeek.rules /etc/udev/rules.d/
+sudo cp udev/99-monsgeek.rules /etc/udev/rules.d/
 
 # Reload rules
 sudo udevadm control --reload-rules && sudo udevadm trigger
@@ -35,7 +35,7 @@ cd iot_driver_linux
 cargo build --release
 
 # Run the gRPC server (matches Windows iot_driver.exe behavior)
-./target/release/iot_driver
+./target/release/iot_driver serve
 ```
 
 Output:
@@ -46,11 +46,46 @@ Device ID: 2949
 Server ready with gRPC-Web support
 ```
 
+#### Start it automatically on login (optional)
+
+The server is light (about 14 MB RSS, idle CPU), so it can stay running.
+On non-systemd distros (e.g. Void/runit) an XDG autostart entry works with
+any desktop environment. Create `~/.config/autostart/monsgeek-iot-driver.desktop`:
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=MonsGeek IOT Driver
+Comment=Local gRPC driver (127.0.0.1:3814) for the web.monsgeek.com configurator
+Exec=/path/to/monsgeek-akko-linux/iot_driver_linux/target/release/iot_driver serve
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+```
+
+The server handles hot-plug through udev, so the keyboard does not need to be
+connected at login. To disable autostart, delete the file.
+
 ### 3. Open the web app
 
-Navigate to https://web.monsgeek.com or https://web.akkogear.com in your browser.
+Navigate to **https://web.monsgeek.com** in a Chromium-based browser.
 
 The web app will detect the keyboard through our local gRPC server.
+
+> **Do not use web.akkogear.com on Linux** (verified 2026-11 against bundle
+> `index.3a5d2f54.js`). The two sites are different builds:
+>
+> | Site | Transport on Linux | Device acceptance |
+> |---|---|---|
+> | web.monsgeek.com | local `iot_driver` gRPC on `127.0.0.1:3814` only (no `navigator.hid` in the bundle) | any device ID in its database |
+> | web.akkogear.com | **WebHID only** - it disables the IOT/gRPC path when `platform === "other"` (Linux) | only devices whose database entry has `company === "akko"` |
+>
+> So on akkogear.com the `serve` process never receives a request, and a
+> keyboard registered under another company (e.g. FUN60 PRO, ID 2600,
+> `company: "MonsGeek"`) answers `whoAmI` (0x8F) correctly but is then
+> rejected with `DEVICE_NOT_SUPPORTED` without any visible message: the
+> "Add device" popup closes, the device shows as "Paired", and the UI never
+> advances. Use web.monsgeek.com instead; it is the same official UI.
 
 ## Alternative: Wine Approach
 

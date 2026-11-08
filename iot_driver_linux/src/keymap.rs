@@ -11,7 +11,7 @@ use crate::protocol::hid;
 use monsgeek_transport::protocol::{HidUsage, KeymatrixLayer, MatrixPos, matrix};
 
 use monsgeek_keyboard::{
-    DksConfig, KeyMode, KeyboardError, KeyboardInterface, ModeByte, SNAPTAP_UNBOUND,
+    DksConfig, FnTarget, KeyMode, KeyboardError, KeyboardInterface, ModeByte, SNAPTAP_UNBOUND,
 };
 
 // Re-export from monsgeek-transport so existing `use crate::keymap::{Layer, KeyRef}` still works.
@@ -65,7 +65,7 @@ pub fn set_key(
     let config = action.to_config_bytes();
     match layer.keymatrix_layer() {
         Some(km) => kb.set_keymatrix_config(kb.active_profile(), index.get(), km, config, true),
-        None => kb.set_fn_config(kb.active_profile(), index.get(), config),
+        None => kb.set_fn_config(index.get(), config),
     }
 }
 
@@ -88,6 +88,168 @@ pub fn device_default_keycode(kb: &KeyboardInterface, pos: MatrixPos) -> HidUsag
     kb.matrix_default(pos.into())
         .map(HidUsage::new)
         .unwrap_or_else(|| default_keycode(pos))
+}
+
+// ---------------------------------------------------------------------------
+// Key names typed on the command line
+// ---------------------------------------------------------------------------
+
+/// One board's key vocabulary: what each matrix position is called and what it
+/// types out of the box.
+///
+/// Names typed on the command line resolve against this, and labels printed back
+/// come from it, so anything the CLI prints can be typed back in. The generic
+/// [`matrix`] table only describes the M1 V5 layout: on a 60% board such as the
+/// FUN60 PRO its "RCtl" (71) is the Fn key and its "Left" (77) is Application, so
+/// resolving names through it writes to the wrong key.
+#[derive(Debug, Clone)]
+pub struct KeyTable {
+    /// Name per position; empty where the board has no key it knows of.
+    names: Vec<String>,
+    /// Factory-default usage per position.
+    defaults: Vec<HidUsage>,
+}
+
+impl KeyTable {
+    /// The connected board's table.
+    ///
+    /// When the device database names the board's keys, only those names are
+    /// accepted: the generic table also names positions the board has no key at
+    /// (a 60% has no Home), and resolving to one of those writes to nothing.
+    pub fn from_device(kb: &KeyboardInterface) -> Self {
+        let device: Vec<String> = (0..MATRIX_POSITIONS)
+            .map(|i| match kb.matrix_key_name(i) {
+                "?" => String::new(),
+                name => name.to_string(),
+            })
+            .collect();
+        let names = if device.iter().any(|n| !n.is_empty()) {
+            device
+        } else {
+            Self::generic().names
+        };
+        let defaults = (0..MATRIX_POSITIONS)
+            .map(|i| device_default_keycode(kb, MatrixPos::new(i as u8)))
+            .collect();
+        Self { names, defaults }
+    }
+
+    /// The generic (M1 V5) table, for boards the database does not describe.
+    pub fn generic() -> Self {
+        let positions = (0..MATRIX_POSITIONS).map(|i| MatrixPos::new(i as u8));
+        Self {
+            names: positions
+                .clone()
+                .map(|p| match matrix::key_name(p) {
+                    "?" => String::new(),
+                    name => name.to_string(),
+                })
+                .collect(),
+            defaults: positions.map(default_keycode).collect(),
+        }
+    }
+
+    /// A table from explicit names and defaults, one entry per position.
+    pub fn new(names: Vec<String>, defaults: Vec<HidUsage>) -> Self {
+        Self { names, defaults }
+    }
+
+    /// Display name for a position: its name in this table, else `#N`. Either
+    /// form is accepted back by [`resolve`](Self::resolve).
+    pub fn label(&self, pos: MatrixPos) -> String {
+        match self.names.get(usize::from(pos)) {
+            Some(name) if !name.is_empty() => name.clone(),
+            _ => format!("#{}", pos.get()),
+        }
+    }
+
+    /// Label with its layer prefix, e.g. `Fn+RCtrl`.
+    pub fn ref_label(&self, pos: MatrixPos, layer: Layer) -> String {
+        format!("{}{}", layer.prefix(), self.label(pos))
+    }
+
+    /// Factory-default usage at a position.
+    pub fn default_keycode(&self, pos: MatrixPos) -> HidUsage {
+        self.defaults
+            .get(usize::from(pos))
+            .copied()
+            .unwrap_or(HidUsage::NONE)
+    }
+
+    /// Resolve a key typed as `#N`, a bare position number, or a name.
+    pub fn resolve(&self, key: &str) -> Result<MatrixPos, String> {
+        let key = key.trim();
+        if let Some(n) = key.strip_prefix('#') {
+            return n
+                .trim()
+                .parse::<u8>()
+                .map(MatrixPos::new)
+                .map_err(|_| format!("invalid matrix position: \"{key}\""));
+        }
+        if let Ok(n) = key.parse::<u8>() {
+            return Ok(MatrixPos::new(n));
+        }
+        self.resolve_name(key)
+    }
+
+    /// Resolve a key name, case-insensitively.
+    ///
+    /// The board's own name wins. Failing that, a name that denotes a keycode
+    /// (`Menu`, `RCtrl`, `Caps`) picks the key that types it by default, so the
+    /// usual spellings work whatever the database calls the key. A name matching
+    /// more than one key is an error rather than a guess.
+    pub fn resolve_name(&self, name: &str) -> Result<MatrixPos, String> {
+        let named: Vec<MatrixPos> = self
+            .positions()
+            .filter(|&p| self.names[usize::from(p)].eq_ignore_ascii_case(name))
+            .collect();
+        if !named.is_empty() {
+            return Self::single(name, &named);
+        }
+        if let Some(code) = hid::key_code_from_name(name).filter(|&c| c != HidUsage::NONE) {
+            let typing: Vec<MatrixPos> = self
+                .positions()
+                .filter(|&p| self.default_keycode(p) == code)
+                .collect();
+            if !typing.is_empty() {
+                return Self::single(name, &typing);
+            }
+        }
+        Err(format!(
+            "unknown key: \"{name}\". Use a key name this keyboard has (see `keymatrix -u`) \
+             or a matrix position like #42"
+        ))
+    }
+
+    /// Parse a key reference with an optional layer prefix (`Fn+RCtrl`, `L1+#42`).
+    ///
+    /// The layer is `None` when no prefix was given, so the caller can fall back
+    /// to its `--layer` flag.
+    pub fn parse_ref(&self, s: &str) -> Result<(Option<Layer>, MatrixPos), String> {
+        let (layer, key) = Layer::split_prefix(s);
+        Ok((layer, self.resolve(key)?))
+    }
+
+    /// Positions the board has a key at.
+    fn positions(&self) -> impl Iterator<Item = MatrixPos> + '_ {
+        (0..self.names.len())
+            .filter(|&i| !self.names[i].is_empty())
+            .map(|i| MatrixPos::new(i as u8))
+    }
+
+    fn single(name: &str, found: &[MatrixPos]) -> Result<MatrixPos, String> {
+        match found {
+            [only] => Ok(*only),
+            _ => Err(format!(
+                "\"{name}\" matches more than one key here ({}); use the matrix position",
+                found
+                    .iter()
+                    .map(|p| format!("#{}", p.get()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
 }
 
 /// Reset a key to its firmware default.
@@ -175,8 +337,12 @@ impl KeyRow {
 /// Load the fused per-key rows for every physical key. All reads are bulk (no
 /// per-key round-trips); mode-specific tables tolerate failure on older firmware.
 ///
-/// `sys` selects the Fn table's OS variant (0 = Windows, 1 = Mac).
-pub fn load_key_rows(kb: &KeyboardInterface, sys: u8) -> Result<Vec<KeyRow>, KeyboardError> {
+/// `sys` selects the Fn table's OS variant (0 = Windows, 1 = Mac); `None` reads
+/// the one the keyboard is running. The Fn layer is always the live one.
+pub fn load_key_rows(
+    kb: &KeyboardInterface,
+    sys: Option<u8>,
+) -> Result<Vec<KeyRow>, KeyboardError> {
     // Every position the firmware's keymatrix array holds, not just the ones the
     // device database names. The encoder's mode toggle sits at 92 and its
     // alternate rotation bindings at 96/97 — all unnamed, and all invisible while
@@ -191,7 +357,16 @@ pub fn load_key_rows(kb: &KeyboardInterface, sys: u8) -> Result<Vec<KeyRow>, Key
         kb.get_keymatrix(profile, KeymatrixLayer::ALL[2], KEYMATRIX_PAGES)?,
         kb.get_keymatrix(profile, KeymatrixLayer::ALL[3], KEYMATRIX_PAGES)?,
     ];
-    let fn_layer = kb.get_fn_keymatrix(profile, sys, KEYMATRIX_PAGES).ok();
+    let fn_layer = kb
+        .active_fn_target()
+        .and_then(|live| {
+            let target = FnTarget {
+                sys: sys.unwrap_or(live.sys),
+                ..live
+            };
+            kb.get_fn_keymatrix(target, KEYMATRIX_PAGES)
+        })
+        .ok();
 
     // Magnetism table + mode-specific bulk reads.
     let trig = kb.get_all_triggers()?;
@@ -200,27 +375,17 @@ pub fn load_key_rows(kb: &KeyboardInterface, sys: u8) -> Result<Vec<KeyRow>, Key
     let modtap = kb.get_modtap_times().unwrap_or_default();
     let snaptap = kb.get_snaptap_binds().unwrap_or_default();
 
+    // Device-resolved names first (profile merged with the matrix DB), falling back
+    // to the generic table. Without this a board's own keys (the M1 V5's volume
+    // encoder at 90/91, say) read as unnamed.
+    let table = KeyTable::from_device(kb);
     Ok(build_key_rows(&RawKeyRows {
         key_count,
         names: (0..key_count)
-            .map(|i| {
-                // Device-resolved names first (profile merged with the matrix DB),
-                // falling back to the generic table. Without this a board's own keys
-                // — the M1 V5's volume encoder at 90/91, say — read as unnamed.
-                // "?" is the no-name marker in both tables, so it must not win here
-                // or the row gets an unaddressable label.
-                let device = kb.matrix_key_name(i);
-                if !device.is_empty() && device != "?" {
-                    return device.to_string();
-                }
-                match matrix::key_name(MatrixPos::new(i as u8)) {
-                    "?" => format!("#{i}"),
-                    generic => generic.to_string(),
-                }
-            })
+            .map(|i| table.label(MatrixPos::new(i as u8)))
             .collect(),
         defaults: (0..key_count)
-            .map(|i| device_default_keycode(kb, MatrixPos::new(i as u8)))
+            .map(|i| table.default_keycode(MatrixPos::new(i as u8)))
             .collect(),
         layers,
         fn_layer,
@@ -339,6 +504,100 @@ pub fn build_key_rows(raw: &RawKeyRows) -> Vec<KeyRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- KeyTable --
+
+    fn table(keys: &[(usize, &str, u8)]) -> KeyTable {
+        let mut names = vec![String::new(); MATRIX_POSITIONS];
+        let mut defaults = vec![HidUsage::NONE; MATRIX_POSITIONS];
+        for &(pos, name, code) in keys {
+            names[pos] = name.to_string();
+            defaults[pos] = HidUsage::new(code);
+        }
+        KeyTable::new(names, defaults)
+    }
+
+    /// The FUN60 PRO's bottom right, as its database names it. Where the generic
+    /// table has "RCtl" (71) this board has its unnamed Fn key, where it has
+    /// "Left" (77) Application, and where it has "Down" (83) RCtrl.
+    fn fun60_corner() -> KeyTable {
+        table(&[
+            (3, "CapsLock", 0x39),
+            (65, "RAlt", 0xE6),
+            (77, "Application", 0x65),
+            (83, "RCtrl", 0xE4),
+        ])
+    }
+
+    fn pos(n: u8) -> MatrixPos {
+        MatrixPos::new(n)
+    }
+
+    #[test]
+    fn key_table_board_name_beats_generic_layout() {
+        let t = fun60_corner();
+        assert_eq!(t.resolve("RCtrl"), Ok(pos(83)));
+        assert_eq!(t.resolve("application"), Ok(pos(77)));
+        // The generic spelling reaches the board's RCtrl, not generic position 71.
+        assert_eq!(t.resolve("RCtl"), Ok(pos(83)));
+    }
+
+    #[test]
+    fn key_table_keycode_names_find_the_key_that_types_them() {
+        let t = fun60_corner();
+        assert_eq!(t.resolve("Menu"), Ok(pos(77)));
+        assert_eq!(t.resolve("App"), Ok(pos(77)));
+        assert_eq!(t.resolve("Caps"), Ok(pos(3)));
+    }
+
+    #[test]
+    fn key_table_rejects_names_the_board_does_not_have() {
+        // The generic table has Left at 77 and Home at 85; this board has neither.
+        assert!(fun60_corner().resolve("Left").is_err());
+        assert!(fun60_corner().resolve("Home").is_err());
+    }
+
+    #[test]
+    fn key_table_ambiguous_name_is_an_error_naming_the_positions() {
+        let t = table(&[(59, "RAlt", 0xE6), (65, "RAlt", 0xE6), (17, "LAlt", 0xE2)]);
+        let err = t.resolve("ralt").unwrap_err();
+        assert!(err.contains("#59") && err.contains("#65"), "{err}");
+        // Through the keycode too, not only the name.
+        assert!(t.resolve("AltGr").is_err());
+        assert_eq!(t.resolve("#65"), Ok(pos(65)));
+    }
+
+    #[test]
+    fn key_table_labels_round_trip() {
+        let t = fun60_corner();
+        for p in [3, 65, 71, 77, 83, 125] {
+            let label = t.label(pos(p));
+            assert_eq!(t.resolve(&label), Ok(pos(p)), "{label}");
+        }
+        // Unnamed on this board: the Fn key, and the generic table's "Home".
+        assert_eq!(t.label(pos(71)), "#71");
+        assert_eq!(t.label(pos(85)), "#85");
+    }
+
+    #[test]
+    fn key_table_parse_ref_reports_whether_a_layer_was_given() {
+        let t = fun60_corner();
+        assert_eq!(t.parse_ref("fn+rctrl"), Ok((Some(Layer::Fn), pos(83))));
+        assert_eq!(t.parse_ref("L0+#77"), Ok((Some(Layer::Base), pos(77))));
+        assert_eq!(t.parse_ref("83"), Ok((None, pos(83))));
+        assert_eq!(t.ref_label(pos(83), Layer::Fn), "Fn+RCtrl");
+    }
+
+    #[test]
+    fn key_table_generic_matches_the_generic_layout() {
+        let t = KeyTable::generic();
+        assert_eq!(
+            t.resolve("RCtl"),
+            matrix::key_index_from_name("RCtl").ok_or_else(String::new)
+        );
+        assert_eq!(t.resolve("Home"), Ok(pos(85)));
+        assert_eq!(t.label(pos(85)), "Home");
+    }
 
     // -- Layer --
 

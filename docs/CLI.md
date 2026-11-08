@@ -327,7 +327,36 @@ Remap a key.
 iot_driver remap A B              # A outputs B
 iot_driver remap CapsLock Escape  # CapsLock -> Escape
 iot_driver remap 42 0x29 -l 1     # By matrix index, layer 1
+iot_driver remap Fn+W Up          # Fn layer: Fn+WASD as arrows, one key per call
+iot_driver remap Fn+RCtrl End     # Fn+RCtrl -> End
+iot_driver remap Fn+Menu Home     # Menu finds the key that types App by default
+iot_driver remap 'Fn+#77' Home    # same key, by matrix position
 ```
+
+#### Key names
+
+The source key (in `remap`, `reset-key`, `swap`, `macro`, and `keymatrix -k`)
+resolves against the connected keyboard's own layout, from the device database,
+not a fixed one. Matrix positions differ between models: on a FUN60 PRO, RCtrl
+sits at 83, where an M1 V5 has Down. Resolution order:
+
+1. `#N`, or a bare number (except in `keymatrix -k`, where `9` is the digit key),
+   is a matrix position.
+2. The board's own key name, case-insensitive (`RCtrl`, `Application`,
+   `CapsLock`).
+3. A keycode name (`Menu`, `Caps`, `RCtl`, `Win`) picks the key that types that
+   keycode by default.
+
+A name that matches more than one key is rejected with the positions it matched,
+so use `#N` there. A name the board has no key for, such as `Home` on a 60%, is
+an error instead of a write to an empty position. Output uses the same names, or
+`#N` for positions the database leaves unnamed (the FUN60's Fn key is `#71`), so
+anything printed can be pasted back into a command.
+
+Fn-layer remaps target the OS and Fn layer the keyboard is running. On RY5088
+boards each call reads the whole Fn table, patches the one key, writes the table
+back and waits for the read-back to match, so earlier Fn remaps are kept (the
+firmware's single-key Fn write would drop them, see PROTOCOL.md).
 
 **Aliases:** `set-key`
 
@@ -353,14 +382,21 @@ iot_driver swap CapsLock Escape -l 0
 
 ### keymatrix
 
-Show key matrix mappings.
+Show per-key bindings across layers (customised keys only by default).
 
 ```bash
-iot_driver keymatrix       # Layer 0
-iot_driver keymatrix 1     # Layer 1
+iot_driver keymatrix                 # all layers, customised keys only
+iot_driver keymatrix -l fn           # the Fn table the keyboard is running
+iot_driver keymatrix -l fn -k w,a,s,d
+iot_driver keymatrix -l fn -k rctrl,menu  # names resolve per board, see "Key names"
+iot_driver keymatrix -l fn --sys mac # the Mac variant of the live Fn layer
+iot_driver keymatrix -u --raw        # include factory defaults and raw 4-byte configs
 ```
 
-**Aliases:** `km`
+`--sys` defaults to the OS the keyboard is in (`GET_KBOPTION`), and the Fn layer
+is always the live one, so the output matches what Fn+key does right now.
+
+**Aliases:** `km`, `remaps`, `remap-list`, `fnl`, `fn-layout`
 
 ## Macro Commands
 

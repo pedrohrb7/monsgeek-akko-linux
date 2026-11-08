@@ -1256,6 +1256,113 @@ impl HidCommand for SetFnData {
     }
 }
 
+/// Payload bytes carried by one [`SetFnPageData`] page.
+pub const FN_PAGE_BYTES: usize = 56;
+/// Data pages in a whole-table Fn write: 9 × 56 = 504 bytes = 126 keys × 4.
+pub const FN_DATA_PAGES: u8 = 9;
+/// Size of a whole Fn table on the wire (126 positions × 4 bytes).
+pub const FN_TABLE_BYTES: usize = FN_PAGE_BYTES * FN_DATA_PAGES as usize;
+
+/// SET_FN (0x10) whole-table page — 63-byte payload, Bit7 checksum.
+///
+/// The RY5088 firmware keeps **one** pending single-key Fn edit: every
+/// [`SetFnData`] write rebuilds the table from the factory default plus that one
+/// key, so a second single-key write drops the first (verified on a FUN60 PRO,
+/// ID 2600). Writing the whole table with these pages is the only way to hold
+/// more than one Fn customisation.
+///
+/// Layout, from the official app's `CommonKBRY5088._setFnKeyConfig`:
+/// `[sys, fn_layer, 0xFF, page, len, last, checksum, payload × 56]`.
+/// Pages 0-8 carry 56 bytes each; page 9 is a commit marker with `len = 0`,
+/// `last = 1` and an empty payload. `fn_layer` is the Fn layer index the
+/// keyboard reports in `GET_KBOPTION` byte 2, not a profile.
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, KnownLayout, Immutable)]
+#[repr(C)]
+pub struct SetFnPageData {
+    fn_sys: u8,
+    fn_layer: u8,
+    magic: u8,
+    page: u8,
+    len: u8,
+    last: u8,
+    _checksum: u8,
+    payload: [u8; FN_PAGE_BYTES],
+}
+
+impl SetFnPageData {
+    /// Data page `page` (0-8) of a whole-table write; `chunk` is zero-padded to 56 bytes.
+    pub fn data(
+        fn_sys: u8,
+        fn_layer: u8,
+        page: u8,
+        chunk: &[u8],
+    ) -> Result<Self, KeyMatrixBoundsError> {
+        Self::check_target(fn_sys, fn_layer)?;
+        if page >= FN_DATA_PAGES {
+            return Err(KeyMatrixBoundsError(format!(
+                "Fn data page {page} out of range (max {})",
+                FN_DATA_PAGES - 1
+            )));
+        }
+        if chunk.len() > FN_PAGE_BYTES {
+            return Err(KeyMatrixBoundsError(format!(
+                "Fn page chunk is {} bytes (max {FN_PAGE_BYTES})",
+                chunk.len()
+            )));
+        }
+        let mut payload = [0u8; FN_PAGE_BYTES];
+        payload[..chunk.len()].copy_from_slice(chunk);
+        Ok(Self {
+            fn_sys,
+            fn_layer,
+            magic: 0xFF,
+            page,
+            len: FN_PAGE_BYTES as u8,
+            last: 0,
+            _checksum: 0,
+            payload,
+        })
+    }
+
+    /// The closing page that tells the firmware to apply the staged table.
+    pub fn commit(fn_sys: u8, fn_layer: u8) -> Result<Self, KeyMatrixBoundsError> {
+        Self::check_target(fn_sys, fn_layer)?;
+        Ok(Self {
+            fn_sys,
+            fn_layer,
+            magic: 0xFF,
+            page: FN_DATA_PAGES,
+            len: 0,
+            last: 1,
+            _checksum: 0,
+            payload: [0; FN_PAGE_BYTES],
+        })
+    }
+
+    fn check_target(fn_sys: u8, fn_layer: u8) -> Result<(), KeyMatrixBoundsError> {
+        // 0 Win, 1 Mac, 2 iOS, 3 Android (GET_KBOPTION byte 1).
+        if fn_sys > 3 {
+            return Err(KeyMatrixBoundsError(format!(
+                "Fn OS variant {fn_sys} out of range (max 3)"
+            )));
+        }
+        if fn_layer > MAX_PROFILE {
+            return Err(KeyMatrixBoundsError(format!(
+                "Fn layer {fn_layer} out of range (max {MAX_PROFILE})"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl HidCommand for SetFnPageData {
+    const CMD: u8 = cmd::SET_FN;
+    const CHECKSUM: ChecksumType = ChecksumType::Bit7;
+    fn to_data(&self) -> Vec<u8> {
+        self.as_bytes().to_vec()
+    }
+}
+
 /// GET_KEYMATRIX (0x8A) query data — 4 bytes.
 ///
 /// Byte 3 selects the keymatrix sub-layer, not a second profile: layers 0/1 are the
@@ -2957,6 +3064,43 @@ mod tests {
         assert_eq!(buf[1], cmd::SET_KEYMATRIX); // command byte
         assert_eq!(buf[2], 0); // profile
         assert_eq!(buf[3], 1); // key_index
+    }
+
+    #[test]
+    fn test_set_fn_page_data_layout() {
+        assert_eq!(std::mem::size_of::<SetFnPageData>(), 63);
+        let chunk: Vec<u8> = (1..=56).collect();
+        let pkt = SetFnPageData::data(0, 1, 3, &chunk).unwrap();
+        let buf = pkt.build();
+        assert_eq!(buf.len(), REPORT_SIZE);
+        assert_eq!(buf[1], cmd::SET_FN);
+        assert_eq!(&buf[2..8], &[0, 1, 0xFF, 3, 56, 0]); // sys, layer, magic, page, len, last
+        assert_eq!(&buf[9..65], chunk.as_slice()); // payload after the checksum byte
+    }
+
+    #[test]
+    fn test_set_fn_page_pads_short_chunk() {
+        let pkt = SetFnPageData::data(1, 0, 8, &[0xAA, 0xBB]).unwrap();
+        let bytes = pkt.as_bytes();
+        assert_eq!(&bytes[7..9], &[0xAA, 0xBB]);
+        assert!(bytes[9..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_set_fn_page_commit() {
+        let pkt = SetFnPageData::commit(0, 1).unwrap();
+        let bytes = pkt.as_bytes();
+        assert_eq!(&bytes[..6], &[0, 1, 0xFF, FN_DATA_PAGES, 0, 1]);
+        assert!(bytes[7..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_set_fn_page_rejects_out_of_range() {
+        assert!(SetFnPageData::data(0, 0, FN_DATA_PAGES, &[]).is_err());
+        assert!(SetFnPageData::data(0, 0, 0, &[0; FN_PAGE_BYTES + 1]).is_err());
+        assert!(SetFnPageData::data(4, 0, 0, &[]).is_err());
+        assert!(SetFnPageData::commit(0, MAX_PROFILE + 1).is_err());
+        assert_eq!(FN_TABLE_BYTES, 126 * 4);
     }
 
     #[test]

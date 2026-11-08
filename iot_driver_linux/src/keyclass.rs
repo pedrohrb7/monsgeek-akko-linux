@@ -8,7 +8,7 @@
 //! modifier rule consults the HID table (`crate::protocol::hid`); the transport
 //! crate stays wire-only.
 
-use crate::keymap::default_keycode;
+use crate::keymap::{KeyTable, default_keycode};
 use monsgeek_transport::protocol::{MatrixPos, matrix};
 use std::fmt;
 use std::str::FromStr;
@@ -207,35 +207,53 @@ enum Term {
     Class(KeyClass),
     Index(MatrixPos),
     Range(u8, u8),
+    /// A key name, resolved against the board's [`KeyTable`] once it is known:
+    /// the same name sits at different positions on different layouts.
+    Name(String),
 }
 
 impl KeySelector {
     /// Matrix positions this term selects.
-    fn members(&self) -> Vec<MatrixPos> {
-        match self.term {
+    fn members(&self, table: &KeyTable) -> Result<Vec<MatrixPos>, String> {
+        Ok(match &self.term {
             Term::Class(c) => c.members(),
-            Term::Index(i) => vec![i],
-            Term::Range(a, b) => (a..=b).map(MatrixPos::new).collect(),
-        }
+            Term::Index(i) => vec![*i],
+            Term::Range(a, b) => (*a..=*b).map(MatrixPos::new).collect(),
+            Term::Name(name) => vec![table.resolve_name(name).map_err(|_| unknown_term(name))?],
+        })
     }
 
     /// Resolve a whole selector list: the union of the positive terms (or every
     /// named position when there are none) minus the union of the negated ones.
-    pub fn resolve(selectors: &[KeySelector]) -> Vec<MatrixPos> {
-        let positive: Vec<&KeySelector> = selectors.iter().filter(|s| !s.negated).collect();
-        let mut keys: Vec<MatrixPos> = if positive.is_empty() {
-            KeyClass::All.members()
-        } else {
-            positive.iter().flat_map(|s| s.members()).collect()
-        };
+    pub fn resolve(selectors: &[KeySelector], table: &KeyTable) -> Result<Vec<MatrixPos>, String> {
+        let mut keys: Vec<MatrixPos> = Vec::new();
+        let mut any_positive = false;
+        for s in selectors.iter().filter(|s| !s.negated) {
+            any_positive = true;
+            keys.extend(s.members(table)?);
+        }
+        if !any_positive {
+            keys = KeyClass::All.members();
+        }
         for excluded in selectors.iter().filter(|s| s.negated) {
-            let drop = excluded.members();
+            let drop = excluded.members(table)?;
             keys.retain(|k| !drop.contains(k));
         }
         keys.sort_by_key(|&i| (i.row(), i.col()));
         keys.dedup();
-        keys
+        Ok(keys)
     }
+}
+
+fn unknown_term(body: &str) -> String {
+    format!(
+        "unknown key or class: \"{body}\". Classes: {}; or a key name, #index, or N..M range",
+        KeyClass::ALL
+            .iter()
+            .map(|c| c.label().to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 impl FromStr for KeySelector {
@@ -292,26 +310,17 @@ impl FromStr for KeySelector {
             .find(|(alias, _)| alias.eq_ignore_ascii_case(body))
             .map(|&(_, name)| name)
             .unwrap_or(body);
-        if let Some(pos) = matrix::key_index_from_name(aliased) {
-            return Ok(Self {
-                negated,
-                term: Term::Index(pos),
-            });
-        }
-        Err(format!(
-            "unknown key or class: \"{body}\". Classes: {}; or a key name, #index, or N..M range",
-            KeyClass::ALL
-                .iter()
-                .map(|c| c.label().to_ascii_lowercase())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))
+        Ok(Self {
+            negated,
+            term: Term::Name(aliased.to_string()),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use monsgeek_transport::protocol::HidUsage;
 
     /// The seven content classes are disjoint and cover every named position. If a
     /// name is added to the matrix table without a home, this fails.
@@ -364,7 +373,7 @@ mod tests {
             .split(',')
             .map(|t| t.parse().unwrap_or_else(|e| panic!("{t}: {e}")))
             .collect();
-        KeySelector::resolve(&sels)
+        KeySelector::resolve(&sels, &KeyTable::generic()).unwrap_or_else(|e| panic!("{spec}: {e}"))
     }
 
     #[test]
@@ -418,9 +427,27 @@ mod tests {
 
     #[test]
     fn unknown_token_lists_the_classes() {
-        let err = "nonsense".parse::<KeySelector>().unwrap_err();
+        let sel: KeySelector = "nonsense".parse().unwrap();
+        let err = KeySelector::resolve(&[sel], &KeyTable::generic()).unwrap_err();
         assert!(err.contains("alpha"), "{err}");
         assert!(err.contains("function"), "{err}");
+    }
+
+    /// Names go through the board's own table, not the generic layout.
+    #[test]
+    fn names_resolve_against_the_board_table() {
+        let mut names = vec![String::new(); 126];
+        let mut defaults = vec![HidUsage::NONE; 126];
+        // The FUN60 PRO's RCtrl sits where the generic table has "Down"; its
+        // generic "RCtl" (71) is the board's Fn key.
+        names[83] = "RCtrl".into();
+        defaults[83] = HidUsage::new(0xE4);
+        let table = KeyTable::new(names, defaults);
+        let sel: KeySelector = "rctrl".parse().unwrap();
+        assert_eq!(
+            KeySelector::resolve(&[sel], &table).unwrap(),
+            vec![MatrixPos::new(83)]
+        );
     }
 
     #[test]

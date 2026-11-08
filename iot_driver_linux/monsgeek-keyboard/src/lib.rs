@@ -87,10 +87,24 @@ use monsgeek_transport::protocol::{
 use monsgeek_transport::{ChecksumType, FlowControlTransport, Transport};
 // Typed commands
 use monsgeek_transport::command::{
-    GetFnData, GetKeyMatrixData, GetMacroData, GetMultiMagnetismData, HidCommand,
-    LedParamsResponse as TransportLedParamsResponse, QueryLedParams, SetFnData, SetKeyMatrixData,
-    SetMacroCommand, SetMagnetismReport, SetMultiMagnetismCommand, SetMultiMagnetismHeader,
+    FN_PAGE_BYTES, FN_TABLE_BYTES, GetFnData, GetKeyMatrixData, GetMacroData,
+    GetMultiMagnetismData, HidCommand, LedParamsResponse as TransportLedParamsResponse,
+    MAX_KEY_INDEX, QueryLedParams, SetFnData, SetFnPageData, SetKeyMatrixData, SetMacroCommand,
+    SetMagnetismReport, SetMultiMagnetismCommand, SetMultiMagnetismHeader,
 };
+
+/// GET_FN pages for a whole Fn table: 8 × 64 = 512 bytes, covering all 126 positions.
+const FN_READ_PAGES: usize = 8;
+/// Read-back polling after a whole-table Fn write: up to 20 × 100 ms.
+const FN_SETTLE_ATTEMPTS: u32 = 20;
+const FN_SETTLE_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// One Fn table: the OS variant (0 Win, 1 Mac, 2 iOS, 3 Android) and the Fn layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FnTarget {
+    pub sys: u8,
+    pub layer: u8,
+}
 use zerocopy::IntoBytes;
 
 /// Wire step for the Mod-Tap decision time: the firmware stores `ms / 10` in a
@@ -1535,6 +1549,28 @@ impl KeyboardInterface {
         }
     }
 
+    /// The Fn table the keyboard is running right now.
+    ///
+    /// On RY5088 the board keeps one Fn table per (OS, Fn layer) pair and reports
+    /// both in `GET_KBOPTION` (byte 1 OS, byte 2 Fn layer); the official app reads
+    /// and writes exactly that pair. Holding Fn+O for ~3 s switches the OS on a
+    /// FUN60 PRO, and the Fn layer was seen to change too, so neither can be assumed.
+    /// Other families keep the historical Windows table of the active profile.
+    pub fn active_fn_target(&self) -> Result<FnTarget, KeyboardError> {
+        if self.commands.fn_table_write {
+            let opts = self.get_kb_options()?;
+            Ok(FnTarget {
+                sys: opts.os_mode,
+                layer: opts.fn_layer,
+            })
+        } else {
+            Ok(FnTarget {
+                sys: 0,
+                layer: self.active_profile().get(),
+            })
+        }
+    }
+
     /// Read the Fn layer key matrix using GET_FN (0x90).
     ///
     /// Unlike [`get_keymatrix`](Self::get_keymatrix) which reads base remaps via GET_KEYMATRIX (0x8A),
@@ -1542,21 +1578,19 @@ impl KeyboardInterface {
     /// via the dedicated GET_FN command.
     ///
     /// # Arguments
-    /// * `profile` - Profile index (0-3)
-    /// * `sys` - OS mode: 0=Windows, 1=Mac
+    /// * `target` - OS variant and Fn layer to read (see [`active_fn_target`](Self::active_fn_target))
     /// * `num_pages` - Number of pages to read (8 for full matrix)
     pub fn get_fn_keymatrix(
         &self,
-        profile: Profile,
-        sys: u8,
+        target: FnTarget,
         num_pages: usize,
     ) -> Result<Vec<u8>, KeyboardError> {
         let mut all_data = Vec::new();
 
         for page in 0..num_pages {
             let query = GetFnData {
-                sys,
-                profile: profile.get(),
+                sys: target.sys,
+                profile: target.layer,
                 magic: 0xFF,
                 page: page as u8,
             };
@@ -1576,19 +1610,99 @@ impl KeyboardInterface {
         }
     }
 
-    /// Write a key's 4-byte config to the Fn layer (SET_FN, 0x10).
+    /// Read one whole Fn table: [`FN_TABLE_BYTES`] bytes, 4 per matrix position.
+    pub fn get_fn_table(&self, target: FnTarget) -> Result<Vec<u8>, KeyboardError> {
+        let mut table = self.get_fn_keymatrix(target, FN_READ_PAGES)?;
+        if table.len() < FN_TABLE_BYTES {
+            return Err(KeyboardError::UnexpectedResponse(format!(
+                "GET_FN returned {} bytes, expected at least {FN_TABLE_BYTES}",
+                table.len()
+            )));
+        }
+        table.truncate(FN_TABLE_BYTES);
+        Ok(table)
+    }
+
+    /// Replace one whole Fn table (SET_FN, 0x10, 9 data pages + commit).
+    ///
+    /// RY5088 only: see [`SetFnPageData`] for why single-key writes cannot hold
+    /// more than one Fn customisation there.
+    pub fn set_fn_table(&self, target: FnTarget, table: &[u8]) -> Result<(), KeyboardError> {
+        if !self.commands.fn_table_write {
+            return Err(KeyboardError::NotSupported(
+                "whole-table Fn write is only known for RY5088 firmware".into(),
+            ));
+        }
+        if table.len() != FN_TABLE_BYTES {
+            return Err(KeyboardError::InvalidParameter(format!(
+                "Fn table must be {FN_TABLE_BYTES} bytes, got {}",
+                table.len()
+            )));
+        }
+        for (page, chunk) in table.chunks(FN_PAGE_BYTES).enumerate() {
+            self.transport.send(&SetFnPageData::data(
+                target.sys,
+                target.layer,
+                page as u8,
+                chunk,
+            )?)?;
+        }
+        self.transport
+            .send(&SetFnPageData::commit(target.sys, target.layer)?)?;
+        Ok(())
+    }
+
+    /// Write a key's 4-byte config to the Fn table the keyboard is running.
     ///
     /// The Fn layer is a separate store from the keymatrix; an all-zero entry there
     /// is transparent fall-through rather than silence.
-    pub fn set_fn_config(
-        &self,
-        profile: Profile,
-        key_index: u8,
-        config: [u8; 4],
-    ) -> Result<(), KeyboardError> {
-        self.transport
-            .send(&SetFnData::new(0, profile.get(), key_index, config)?)?;
-        Ok(())
+    ///
+    /// On RY5088 this reads the live table, patches the one key and writes the
+    /// whole table back, then reads it again to confirm every key survived.
+    pub fn set_fn_config(&self, key_index: u8, config: [u8; 4]) -> Result<(), KeyboardError> {
+        let target = self.active_fn_target()?;
+        if !self.commands.fn_table_write {
+            self.transport.send(&SetFnData::new(
+                target.sys,
+                target.layer,
+                key_index,
+                config,
+            )?)?;
+            return Ok(());
+        }
+        if key_index > MAX_KEY_INDEX {
+            return Err(KeyboardError::InvalidParameter(format!(
+                "key_index {key_index} out of range (max {MAX_KEY_INDEX})"
+            )));
+        }
+
+        let mut table = self.get_fn_table(target)?;
+        let at = key_index as usize * 4;
+        if table[at..at + 4] == config {
+            return Ok(());
+        }
+        table[at..at + 4].copy_from_slice(&config);
+        self.set_fn_table(target, &table)?;
+
+        // The firmware applies the staged table after the commit page (a flash
+        // write), and GET_FN answers with stale data until it has: a read straight
+        // after the commit differs in ~30 positions even though the write landed.
+        // Poll until it settles rather than guessing a fixed delay.
+        let mut differing = 0;
+        for attempt in 1..=FN_SETTLE_ATTEMPTS {
+            std::thread::sleep(FN_SETTLE_STEP);
+            let written = self.get_fn_table(target)?;
+            if written == table {
+                tracing::debug!("Fn table settled after {attempt} read(s)");
+                return Ok(());
+            }
+            differing = (0..FN_TABLE_BYTES / 4)
+                .filter(|i| written[i * 4..i * 4 + 4] != table[i * 4..i * 4 + 4])
+                .count();
+        }
+        Err(KeyboardError::UnexpectedResponse(format!(
+            "Fn table read-back still differs from what was written ({differing} position(s))"
+        )))
     }
 
     /// Set a single key's mapping (base layer only).
@@ -1629,7 +1743,7 @@ impl KeyboardInterface {
             Layer::Base => Err(KeyboardError::InvalidParameter(
                 "base layer has no ROM fallback; write the factory keycode instead".into(),
             )),
-            Layer::Fn => self.set_fn_config(self.active_profile(), key_index, [0, 0, 0, 0]),
+            Layer::Fn => self.set_fn_config(key_index, [0, 0, 0, 0]),
             Layer::Layer1 => self.set_keymatrix_config(
                 self.active_profile(),
                 key_index,
@@ -1832,7 +1946,7 @@ impl KeyboardInterface {
             Some(km) => {
                 self.set_keymatrix_config(self.active_profile(), key_index, km, config, true)
             }
-            None => self.set_fn_config(self.active_profile(), key_index, config),
+            None => self.set_fn_config(key_index, config),
         }
     }
 

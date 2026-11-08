@@ -735,6 +735,32 @@ impl Layer {
         }
     }
 
+    /// The prefix a key reference carries for this layer: `""`, `"L1+"`, `"Fn+"`.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Layer::Base => "",
+            Layer::Layer1 => "L1+",
+            Layer::Fn => "Fn+",
+        }
+    }
+
+    /// Split a layer prefix (`Fn+`, `L1+`, `L0+`, any case) off a key reference.
+    ///
+    /// Returns `None` for the layer when there is no prefix, so a caller can tell
+    /// "base layer, by default" from "base layer, asked for with `L0+`".
+    pub fn split_prefix(s: &str) -> (Option<Layer>, &str) {
+        for (prefix, layer) in [
+            ("Fn+", Layer::Fn),
+            ("L1+", Layer::Layer1),
+            ("L0+", Layer::Base),
+        ] {
+            if let Some(rest) = strip_prefix_ci(s, prefix) {
+                return (Some(layer), rest);
+            }
+        }
+        (None, s)
+    }
+
     /// Which keymatrix sub-layer backs this layer, if any.
     ///
     /// `Fn` returns `None`: it is a separate store (SET_FN / GET_FN), so a caller
@@ -806,11 +832,7 @@ impl KeyRef {
 
 impl fmt::Display for KeyRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let prefix = match self.layer {
-            Layer::Base => "",
-            Layer::Layer1 => "L1+",
-            Layer::Fn => "Fn+",
-        };
+        let prefix = self.layer.prefix();
         // "?" is the table's no-name marker and cannot be typed back in. Show the
         // position instead, in the same `#N` form the keymatrix listing uses and
         // `resolve_key` accepts — so anything printed here can be pasted into a
@@ -834,16 +856,8 @@ impl FromStr for KeyRef {
     /// - `"42"` → KeyRef { index=42, layer=Base }
     /// - `"Fn+42"` → KeyRef { index=42, layer=Fn }
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Check for layer prefix: "Fn+", "L1+", "L0+"
-        let (layer, key_part) = if let Some(rest) = strip_prefix_ci(s, "Fn+") {
-            (Layer::Fn, rest)
-        } else if let Some(rest) = strip_prefix_ci(s, "L1+") {
-            (Layer::Layer1, rest)
-        } else if let Some(rest) = strip_prefix_ci(s, "L0+") {
-            (Layer::Base, rest)
-        } else {
-            (Layer::Base, s)
-        };
+        let (layer, key_part) = Layer::split_prefix(s);
+        let layer = layer.unwrap_or(Layer::Base);
 
         let index = resolve_key(key_part)?;
         Ok(KeyRef {
@@ -928,6 +942,11 @@ pub struct CommandTable {
     pub get_report: Option<u8>,
     pub get_kboption: Option<u8>,
     pub get_sleeptime: Option<u8>,
+    /// Fn edits must go through the whole-table `SET_FN` write
+    /// ([`SetFnPageData`](crate::command::SetFnPageData)) and address the Fn
+    /// layer and OS the board reports in `GET_KBOPTION`. True on RY5088, whose
+    /// single-key `SET_FN` keeps only the most recent edit.
+    pub fn_table_write: bool,
 }
 
 pub static RY5088_COMMANDS: CommandTable = CommandTable {
@@ -945,6 +964,7 @@ pub static RY5088_COMMANDS: CommandTable = CommandTable {
     get_report: Some(0x83),
     get_kboption: Some(0x89),
     get_sleeptime: Some(0x91),
+    fn_table_write: true,
 };
 
 pub static YICHIP_COMMANDS: CommandTable = CommandTable {
@@ -962,6 +982,7 @@ pub static YICHIP_COMMANDS: CommandTable = CommandTable {
     get_report: None,
     get_kboption: Some(0x86),
     get_sleeptime: None,
+    fn_table_write: false,
 };
 
 impl ProtocolFamily {

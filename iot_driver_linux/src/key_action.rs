@@ -98,6 +98,11 @@ mod special_fn {
     /// Toggle flags1 bit 3; apply_config_changes + clear reports; BT notify.
     pub const WASD_SWAP: u8 = 0x0a;
     /// Toggle flags2 bit 0 (NKRO); apply_config_changes + clear reports; BT notify.
+    ///
+    /// That is the M1 V5 v407 firmware. On a FUN60 PRO (ID 2600, fw 0x0402) the
+    /// factory `Fn+RAlt` carries this sub-function and pressing it flips the Fn
+    /// layer instead (`GET_KBOPTION` byte 2, `fnIndex`, 1 -> 0), so the meaning is
+    /// firmware-specific.
     pub const NKRO_TOGGLE: u8 = 0x0b;
     /// Toggle flags1 bit 4 (same bit as [`FN_TOGGLE`]) WITH bt_event_queue(3).
     pub const FN_LOCK: u8 = 0x0c;

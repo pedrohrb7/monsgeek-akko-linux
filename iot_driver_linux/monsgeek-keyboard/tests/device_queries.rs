@@ -322,13 +322,14 @@ fn macro_set_and_readback() {
     eprintln!("--- SET_MACRO raw test for slot 7 ---");
 
     // Build a minimal macro: repeat=1, one keystroke 'a' down+up
-    let mut macro_data = Vec::new();
-    macro_data.push(0x01); // repeat count low
-    macro_data.push(0x00); // repeat count high
-    macro_data.push(0x04); // 'a' keycode
-    macro_data.push(0x8A); // down + 10ms delay
-    macro_data.push(0x04); // 'a' keycode
-    macro_data.push(0x0A); // up + 10ms delay
+    let mut macro_data = vec![
+        0x01, // repeat count low
+        0x00, // repeat count high
+        0x04, // 'a' keycode
+        0x8A, // down + 10ms delay
+        0x04, // 'a' keycode
+        0x0A, // up + 10ms delay
+    ];
     // Pad to 56 bytes
     while macro_data.len() < 56 {
         macro_data.push(0);
@@ -423,13 +424,14 @@ fn macro_set_and_readback() {
     }
 
     // Write to slot 0
-    let mut macro_data_0 = Vec::new();
-    macro_data_0.push(0x01); // repeat count low
-    macro_data_0.push(0x00); // repeat count high
-    macro_data_0.push(0x17); // 't' keycode
-    macro_data_0.push(0x8A); // down + 10ms delay
-    macro_data_0.push(0x17); // 't' keycode
-    macro_data_0.push(0x0A); // up + 10ms delay
+    let mut macro_data_0 = vec![
+        0x01, // repeat count low
+        0x00, // repeat count high
+        0x17, // 't' keycode
+        0x8A, // down + 10ms delay
+        0x17, // 't' keycode
+        0x0A, // up + 10ms delay
+    ];
     while macro_data_0.len() < 56 {
         macro_data_0.push(0);
     }
