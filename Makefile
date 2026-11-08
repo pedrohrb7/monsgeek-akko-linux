@@ -29,7 +29,7 @@ JOYSTICK_BIN := monsgeek-joystick
 LOADER_BIN := akko-loader
 
 .PHONY: all driver driver-debug bpf clean clean-driver clean-bpf \
-        install install-driver install-udev install-desktop install-bpf install-systemd install-all \
+        install install-user uninstall-user install-driver install-udev install-desktop install-bpf install-systemd install-all \
         uninstall uninstall-driver uninstall-bpf \
         test check fmt help \
         install-tray uninstall-tray run-tray \
@@ -159,6 +159,16 @@ install-desktop:
 		update-desktop-database $(APP_DIR) 2>/dev/null || true; \
 	fi
 	@echo "Installed desktop entry to $(APP_DIR)"
+
+## Per-user install into ~/.local (no root except for udev rules): binary, `monsgeek`
+## TUI launcher, device data, app-menu entry, login autostart of the server, and a
+## server (re)start. Builds the release binary itself; run as your user, NOT sudo.
+install-user:
+	./scripts/install-user.sh install
+
+## Undo install-user (leaves the system-wide udev rules in place)
+uninstall-user:
+	./scripts/install-user.sh uninstall
 
 ## Install driver + udev rules (standard install)
 install: install-driver install-udev install-desktop install-data
@@ -344,7 +354,8 @@ help:
 	@echo "MonsGeek/Akko Keyboard Linux Driver"
 	@echo ""
 	@echo "Quick start:"
-	@echo "  make driver && sudo make install"
+	@echo "  make install-user                 (per-user, ~/.local; server autostarts, 'monsgeek' opens the TUI)"
+	@echo "  make driver && sudo make install  (system-wide, /usr/local)"
 	@echo ""
 	@echo "Build targets (run as regular user):"
 	@echo "  driver       Build driver release binary (default)"
@@ -355,6 +366,10 @@ help:
 	@echo "  check        Run clippy lints"
 	@echo "  fmt          Format code"
 	@echo "  clean        Clean all build artifacts"
+	@echo ""
+	@echo "Per-user install (run as your user, not sudo):"
+	@echo "  install-user    Build + install to ~/.local, autostart server, 'monsgeek' TUI launcher"
+	@echo "  uninstall-user  Undo install-user"
 	@echo ""
 	@echo "Install targets (run with sudo, after building):"
 	@echo "  install         Install driver + udev rules"

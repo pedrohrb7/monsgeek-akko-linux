@@ -49,22 +49,22 @@ Server ready with gRPC-Web support
 #### Start it automatically on login (optional)
 
 The server is light (about 14 MB RSS, idle CPU), so it can stay running.
-On non-systemd distros (e.g. Void/runit) an XDG autostart entry works with
-any desktop environment. Create `~/.config/autostart/monsgeek-iot-driver.desktop`:
+From the repo root, as your normal user:
 
-```ini
-[Desktop Entry]
-Type=Application
-Name=MonsGeek IOT Driver
-Comment=Local gRPC driver (127.0.0.1:3814) for the web.monsgeek.com configurator
-Exec=/path/to/monsgeek-akko-linux/iot_driver_linux/target/release/iot_driver serve
-Terminal=false
-NoDisplay=true
-X-GNOME-Autostart-enabled=true
+```bash
+make install-user
 ```
 
+This copies the binary to `~/.local/bin`, installs the device database to
+`~/.local/share/akko`, adds an XDG autostart entry
+(`~/.config/autostart/monsgeek-iot-driver.desktop`) that runs `iot_driver serve`
+on login, adds a `monsgeek` command and an app-menu entry for the TUI, and starts
+the server immediately (log: `~/.local/state/akko/iot_driver.log`). XDG autostart
+works with any desktop environment and with non-systemd distros (e.g. Void/runit).
+
 The server handles hot-plug through udev, so the keyboard does not need to be
-connected at login. To disable autostart, delete the file.
+connected at login. To disable autostart, delete the autostart file, or run
+`make uninstall-user` to remove the whole per-user install.
 
 ### 3. Open the web app
 
@@ -111,8 +111,12 @@ wine ./iot_driver.exe
 We also built a standalone TUI (Terminal User Interface) that doesn't require a browser:
 
 ```bash
-./target/release/monsgeek-tui
+monsgeek                          # after `make install-user`
+./target/release/iot_driver tui   # straight from a build
 ```
+
+`make install-user` also adds an app-menu entry ("Akko/MonsGeek Keyboard Driver")
+that opens the TUI in a terminal.
 
 Features:
 - **Device Info** - View firmware version, device ID, current settings

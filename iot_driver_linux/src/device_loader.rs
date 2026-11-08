@@ -5,7 +5,8 @@ use crate::profile::types::FnSysLayer;
 use monsgeek_transport::protocol::HidUsage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 /// Travel range configuration from JSON
@@ -405,21 +406,46 @@ pub struct DeviceDatabase {
     matrices: HashMap<i32, Vec<JsonDeviceMatrix>>,
 }
 
-/// Default paths to search for devices.json
-const DEFAULT_DEVICE_DB_PATHS: &[&str] = &[
-    "/usr/local/share/akko/devices.json",
-    "/usr/share/akko/devices.json",
-    "data/devices.json",
-    "../data/devices.json", // When running from iot_driver_linux/
-];
+/// Directories searched, in order, for the device database files.
+///
+/// The per-user XDG data dir comes first (`$XDG_DATA_HOME/akko`, falling back to
+/// `~/.local/share/akko`), where `make install-user` puts the data, so a user
+/// install takes precedence over a system one. The relative `data/` dirs only
+/// match when running from a checkout (repo root or `iot_driver_linux/`).
+fn db_search_dirs() -> Vec<PathBuf> {
+    db_search_dirs_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+}
 
-/// Default paths to search for device_matrices.json
-const DEFAULT_MATRIX_DB_PATHS: &[&str] = &[
-    "/usr/local/share/akko/device_matrices.json",
-    "/usr/share/akko/device_matrices.json",
-    "data/device_matrices.json",
-    "../data/device_matrices.json",
-];
+fn db_search_dirs_from(xdg_data_home: Option<OsString>, home: Option<OsString>) -> Vec<PathBuf> {
+    // The XDG spec says a relative $XDG_DATA_HOME is invalid and must be ignored.
+    let user_data = xdg_data_home
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            home.map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .map(|h| h.join(".local/share"))
+        });
+    user_data
+        .map(|d| d.join("akko"))
+        .into_iter()
+        .chain(
+            [
+                "/usr/local/share/akko",
+                "/usr/share/akko",
+                "data",
+                "../data",
+            ]
+            .into_iter()
+            .map(PathBuf::from),
+        )
+        .collect()
+}
+
+/// Candidate locations for one database file, in search order.
+fn db_file_candidates(file: &str) -> Vec<PathBuf> {
+    db_search_dirs().into_iter().map(|d| d.join(file)).collect()
+}
 
 impl DeviceDatabase {
     /// Create empty database
@@ -436,15 +462,15 @@ impl DeviceDatabase {
 
     /// Load from default paths (tries each in order)
     pub fn load_default() -> Result<Self, String> {
+        let device_paths = db_file_candidates("devices.json");
         let mut db = None;
-        for path in DEFAULT_DEVICE_DB_PATHS {
-            let p = Path::new(path);
+        for p in &device_paths {
             if p.exists() {
                 match Self::load_from_file(p) {
                     Ok(loaded) => {
                         info!(
                             "Loaded device database from {} ({} devices, version {})",
-                            path,
+                            p.display(),
                             loaded.len(),
                             loaded.version
                         );
@@ -452,30 +478,25 @@ impl DeviceDatabase {
                         break;
                     }
                     Err(e) => {
-                        warn!("Failed to load device database from {}: {}", path, e);
+                        warn!("Failed to load device database from {}: {}", p.display(), e);
                     }
                 }
             }
         }
 
-        let mut db = db.ok_or_else(|| {
-            format!(
-                "Device database not found in any of: {:?}",
-                DEFAULT_DEVICE_DB_PATHS
-            )
-        })?;
+        let mut db =
+            db.ok_or_else(|| format!("Device database not found in any of: {device_paths:?}"))?;
 
         // Also try to load matrices
-        for path in DEFAULT_MATRIX_DB_PATHS {
-            let p = Path::new(path);
+        for p in db_file_candidates("device_matrices.json") {
             if p.exists() {
-                match db.load_matrices_from_file(p) {
+                match db.load_matrices_from_file(&p) {
                     Ok(count) => {
-                        info!("Loaded {} device matrices from {}", count, path);
+                        info!("Loaded {} device matrices from {}", count, p.display());
                         break;
                     }
                     Err(e) => {
-                        warn!("Failed to load device matrices from {}: {}", path, e);
+                        warn!("Failed to load device matrices from {}: {}", p.display(), e);
                     }
                 }
             }
@@ -721,6 +742,33 @@ impl Default for DeviceDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn db_search_prefers_xdg_data_home() {
+        let dirs = db_search_dirs_from(Some("/x/data".into()), Some("/home/u".into()));
+        assert_eq!(dirs[0], PathBuf::from("/x/data/akko"));
+        assert_eq!(dirs[1], PathBuf::from("/usr/local/share/akko"));
+        assert_eq!(dirs.last(), Some(&PathBuf::from("../data")));
+    }
+
+    #[test]
+    fn db_search_falls_back_to_home_local_share() {
+        let dirs = db_search_dirs_from(None, Some("/home/u".into()));
+        assert_eq!(dirs[0], PathBuf::from("/home/u/.local/share/akko"));
+    }
+
+    #[test]
+    fn db_search_ignores_relative_xdg_data_home() {
+        let dirs = db_search_dirs_from(Some("rel".into()), Some("/home/u".into()));
+        assert_eq!(dirs[0], PathBuf::from("/home/u/.local/share/akko"));
+    }
+
+    #[test]
+    fn db_search_without_home_has_only_system_and_checkout_dirs() {
+        let dirs = db_search_dirs_from(None, None);
+        assert_eq!(dirs[0], PathBuf::from("/usr/local/share/akko"));
+        assert_eq!(dirs.len(), 4);
+    }
 
     const M1_V5_TMR_VID: u16 = 0x3151;
     const M1_V5_TMR_PID: u16 = 0x5030;

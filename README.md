@@ -105,12 +105,37 @@ sudo zypper install pipewire-devel clang-devel
 ```
 </details>
 
-### Build and Install
+### Per-user install (simplest)
 
 ```bash
 git clone https://github.com/echtzeit-solutions/monsgeek-akko-linux.git
 cd monsgeek-akko-linux
 
+make install-user   # run as your user, not with sudo
+```
+
+This builds the driver and sets everything up under your home directory:
+
+| What | Where |
+|---|---|
+| `iot_driver` binary (copied, so `cargo clean` does not break it) | `~/.local/bin/iot_driver` |
+| `monsgeek` launcher: no arguments opens the TUI, otherwise runs a CLI command (`monsgeek info`) | `~/.local/bin/monsgeek` |
+| Device database | `~/.local/share/akko/` |
+| App menu entry that opens the TUI in a terminal | `~/.local/share/applications/` |
+| Login autostart of `iot_driver serve` (for web.monsgeek.com) | `~/.config/autostart/monsgeek-iot-driver.desktop` |
+| Server log | `~/.local/state/akko/iot_driver.log` |
+
+It also (re)starts the server right away, and asks for sudo only if the udev rules are
+missing or outdated. Autostart uses the XDG autostart spec, so it works with any desktop
+environment and any init system (systemd, runit, OpenRC, ...). Rerun `make install-user`
+after pulling to update; `make uninstall-user` removes it all except the udev rules.
+Options: `scripts/install-user.sh --help` (`--no-build`, `--no-start`, `--no-udev`).
+
+Make sure `~/.local/bin` is on your `PATH` (the installer warns if it is not).
+
+### System-wide install
+
+```bash
 # Build and install driver + udev rules + device database
 make driver
 sudo make install

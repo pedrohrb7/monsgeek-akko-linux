@@ -472,6 +472,9 @@ async fn run_server(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("iot_driver=debug".parse().unwrap()),
         )
+        // Colour only on a terminal: autostart and the installer send this to a
+        // log file, where escape codes are noise.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
 
     let addr = "127.0.0.1:3814".parse()?;
