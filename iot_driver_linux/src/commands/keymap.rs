@@ -148,13 +148,15 @@ pub fn keymatrix(
             }
         }
     };
-    let rows = match keymap::load_key_rows(keyboard, sys.map(|s| s.wire())) {
+    let rows = match keymap::load_key_rows(keyboard, sys.map(|s| s.wire()), &progress_to_stderr) {
         Ok(rows) => rows,
         Err(e) => {
+            clear_progress_line();
             eprintln!("Failed to read key matrix: {e}");
             return Ok(());
         }
     };
+    clear_progress_line();
     let opts = ListOptions {
         layers: layers.iter().map(|&l| l.into()).collect(),
         keys: selected,
@@ -164,4 +166,37 @@ pub fn keymatrix(
     };
     print!("{}", keymatrix_view::render(&rows, &opts));
     Ok(())
+}
+
+/// Progress line for the paged reads behind a full key-matrix load.
+///
+/// Reading every table is ~70 round trips, and on BLE each carries a 150 ms settle
+/// gap — long enough to look hung. Stays on one line via `\r` and only when stderr
+/// is a terminal, so piped or redirected output is unchanged.
+fn progress_to_stderr(stage: keymap::LoadStage) {
+    use std::io::{IsTerminal, Write};
+    let mut err = std::io::stderr();
+    if !err.is_terminal() {
+        return;
+    }
+    // done + 1, matching the TUI gauge: the named stage is in flight, not finished.
+    let width = 20;
+    let filled = (stage.done + 1) * width / stage.total;
+    let _ = write!(
+        err,
+        "\r\x1b[2Kreading {stage} [{}{}]",
+        "#".repeat(filled),
+        "·".repeat(width - filled),
+    );
+    let _ = err.flush();
+}
+
+/// Clear the progress line once the load is done.
+fn clear_progress_line() {
+    use std::io::{IsTerminal, Write};
+    let mut err = std::io::stderr();
+    if err.is_terminal() {
+        let _ = write!(err, "\r\x1b[2K");
+        let _ = err.flush();
+    }
 }

@@ -18,7 +18,7 @@ pub use magnetism::{
 };
 pub use settings::{
     BatteryInfo, FeatureList, FirmwareVersion, KeyboardOptions, PollingRate, Precision,
-    SleepTimeSettings,
+    RT_STABILITY_MAX, RT_STABILITY_STEP_MS, SleepTimeSettings, os_mode_name,
 };
 pub use sync::list_keyboards;
 
@@ -81,8 +81,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use monsgeek_transport::protocol::{
-    CommandTable, DefId, KeymatrixLayer, Layer, LedPos, MacroSlot, Profile, StripIdx, cmd,
-    magnetism as mag_cmd,
+    CommandTable, DefId, INPUT_REPORT_SIZE, KeymatrixLayer, Layer, LedPos, MacroSlot, Profile,
+    StripIdx, cmd, magnetism as mag_cmd,
 };
 use monsgeek_transport::{ChecksumType, FlowControlTransport, Transport};
 // Typed commands
@@ -159,6 +159,24 @@ pub struct KeyboardInterface {
     commands: &'static CommandTable,
 }
 
+/// Userpic flash slots: the firmware keeps them in one 2 KB sector at 384 bytes each.
+const USERPIC_SLOTS: u8 = 5;
+
+/// RGB bytes a userpic carries — one triple for each of the 126 matrix positions
+/// (21 columns × 6 rows) the SET_USERPIC pages cover.
+pub const USERPIC_BYTES: usize = 126 * 3;
+
+fn check_userpic_slot(slot: u8) -> Result<(), KeyboardError> {
+    if slot < USERPIC_SLOTS {
+        Ok(())
+    } else {
+        Err(KeyboardError::InvalidParameter(format!(
+            "Userpic slot must be 0-{}",
+            USERPIC_SLOTS - 1
+        )))
+    }
+}
+
 /// Which config to write into DKS slot 0.
 ///
 /// Slot 0 doubles as keymatrix layer 0 — the key's *base* output once it leaves DKS
@@ -210,6 +228,14 @@ impl KeyboardInterface {
     /// Profile that keymatrix and Fn operations target.
     pub fn active_profile(&self) -> Profile {
         Profile::try_from(self.active_profile.load(Ordering::Relaxed)).unwrap_or_default()
+    }
+
+    /// Pages this interface has read, for progress reporting.
+    ///
+    /// Sample it either side of a long paged load to show how far along it is —
+    /// see [`FlowControlTransport::pages_read`].
+    pub fn pages_read(&self) -> u64 {
+        self.transport.pages_read()
     }
 
     /// Set matrix key names from a device profile.
@@ -531,7 +557,7 @@ impl KeyboardInterface {
             .transport
             .query_command(cmd_byte, &[], ChecksumType::Bit7)?;
 
-        if resp.len() < 9 || resp[0] != cmd_byte {
+        if resp.len() < 6 || resp[0] != cmd_byte {
             return Err(KeyboardError::UnexpectedResponse(
                 "Invalid KB options response".into(),
             ));
@@ -646,57 +672,41 @@ impl KeyboardInterface {
 
     /// Upload a userpic to a flash slot (0-4).
     ///
-    /// `data` must be exactly 288 bytes in column-major format:
-    /// pixel (col, row) at offset `col * 18 + row * 3`.
-    /// Padded to 384 bytes with zeros for the flash slot.
+    /// `data` holds one RGB triple per matrix position (column-major, `col * 6 + row`),
+    /// at most [`USERPIC_BYTES`] of it; the rest of the slot is written black.
     ///
-    /// Uses the SET_USERPIC (0x0C) bulk protocol: 7 pages of 56/42 bytes.
+    /// Sent as SET_USERPIC pages of 56 bytes, the last one short (42 bytes).
     pub fn upload_userpic(&self, slot: u8, data: &[u8]) -> Result<(), KeyboardError> {
-        if slot > 4 {
-            return Err(KeyboardError::InvalidParameter(
-                "Userpic slot must be 0-4".into(),
-            ));
+        let cmd_byte = self.commands.set_userpic.ok_or_else(|| {
+            KeyboardError::NotSupported("User pictures not available on this device".into())
+        })?;
+        check_userpic_slot(slot)?;
+        if data.len() > USERPIC_BYTES {
+            return Err(KeyboardError::InvalidParameter(format!(
+                "Userpic data is {} bytes, a slot holds {USERPIC_BYTES}",
+                data.len()
+            )));
         }
+        let mut slot_data = [0u8; USERPIC_BYTES];
+        slot_data[..data.len()].copy_from_slice(data);
 
-        // Pad data to full slot size (384 bytes)
-        let mut slot_data = vec![0u8; 384];
-        let len = data.len().min(384);
-        slot_data[..len].copy_from_slice(&data[..len]);
-
-        // Send 7 pages: pages 0-5 have 56 bytes, page 6 has 42 bytes
-        // Total: 6*56 + 42 = 378 bytes (covers 384 with some overlap handled by firmware)
         const PAGE_SIZE: usize = 56;
-        const LAST_PAGE_SIZE: usize = 42;
-        const NUM_PAGES: usize = 7;
-
-        for page in 0..NUM_PAGES {
-            let data_size = if page == NUM_PAGES - 1 {
-                LAST_PAGE_SIZE
-            } else {
-                PAGE_SIZE
-            };
-            let is_last = page == NUM_PAGES - 1;
-
-            let start = page * PAGE_SIZE;
-            let end = (start + data_size).min(slot_data.len());
-
-            // Build payload: [slot, 0xFF, page, data_size, last_flag, 0, 0, ...rgb_data...]
-            let mut payload = vec![0u8; 7 + data_size];
-            payload[0] = slot;
-            payload[1] = 0xFF;
-            payload[2] = page as u8;
-            payload[3] = data_size as u8;
-            payload[4] = if is_last { 1 } else { 0 };
-            // payload[5] = 0; payload[6] = 0; // already zero
-            if end > start {
-                let chunk_len = end - start;
-                payload[7..7 + chunk_len].copy_from_slice(&slot_data[start..end]);
-            }
-
+        let last_page = USERPIC_BYTES.div_ceil(PAGE_SIZE) - 1;
+        for (page, chunk) in slot_data.chunks(PAGE_SIZE).enumerate() {
+            // [slot, 0xFF, page, data_size, last_flag, 0, 0, rgb...]
+            let mut payload = vec![
+                slot,
+                0xFF,
+                page as u8,
+                chunk.len() as u8,
+                u8::from(page == last_page),
+                0,
+                0,
+            ];
+            payload.extend_from_slice(chunk);
             self.transport
-                .send_command(cmd::SET_USERPIC, &payload, ChecksumType::Bit7)?;
+                .send_command(cmd_byte, &payload, ChecksumType::Bit7)?;
 
-            // Small delay between pages
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
@@ -705,28 +715,27 @@ impl KeyboardInterface {
 
     /// Download a userpic from a flash slot (0-4).
     ///
-    /// Returns 384 bytes in column-major format (6 blocks × 64 bytes).
-    /// Uses GET_USERPIC (0x8C) block read protocol.
+    /// Returns [`USERPIC_BYTES`] bytes in the layout [`upload_userpic`](Self::upload_userpic)
+    /// takes. Uses the GET_USERPIC (0x8C) block read protocol.
     pub fn download_userpic(&self, slot: u8) -> Result<Vec<u8>, KeyboardError> {
-        if slot > 4 {
-            return Err(KeyboardError::InvalidParameter(
-                "Userpic slot must be 0-4".into(),
-            ));
-        }
+        let cmd_byte = self.commands.get_userpic.ok_or_else(|| {
+            KeyboardError::NotSupported("User pictures not available on this device".into())
+        })?;
+        check_userpic_slot(slot)?;
 
-        let mut data = Vec::with_capacity(384);
-
-        // Read 6 blocks of 64 bytes each
-        for block in 0..6u8 {
+        let mut data = Vec::with_capacity(USERPIC_BYTES.next_multiple_of(INPUT_REPORT_SIZE));
+        for block in 0..USERPIC_BYTES.div_ceil(INPUT_REPORT_SIZE) as u8 {
             let query = [slot, 0xFF, block];
-            let resp = self
-                .transport
-                .query_raw(cmd::GET_USERPIC, &query, ChecksumType::Bit7)?;
+            let resp = self.transport.query_page(
+                cmd_byte,
+                &query,
+                ChecksumType::Bit7,
+                INPUT_REPORT_SIZE,
+            )?;
             data.extend_from_slice(&resp);
         }
 
-        // Truncate to slot size
-        data.truncate(384);
+        data.truncate(USERPIC_BYTES);
         Ok(data)
     }
 
@@ -833,18 +842,17 @@ impl KeyboardInterface {
 
         for page in 0..num_pages {
             let query = GetMultiMagnetismData::paged(sub_cmd, page as u8);
-            match self.transport.query_raw(
+            // Propagate rather than padding with zeros: a fabricated page reads back
+            // as a whole block of keys with 0.00 mm actuation, which is indis-
+            // tinguishable from a real setting. Callers that treat a sub-command as
+            // optional (deadzones on older firmware) already handle the error.
+            let resp = self.transport.query_page(
                 cmd::GET_MULTI_MAGNETISM,
                 query.as_bytes(),
                 ChecksumType::Bit7,
-            ) {
-                Ok(resp) => {
-                    all_data.extend_from_slice(&resp);
-                }
-                Err(_) => {
-                    all_data.extend(std::iter::repeat_n(0u8, 64));
-                }
-            }
+                INPUT_REPORT_SIZE,
+            )?;
+            all_data.extend_from_slice(&resp);
         }
 
         Ok(all_data)
@@ -1529,13 +1537,15 @@ impl KeyboardInterface {
                 layer: layer.get(),
             };
 
-            // `?`, never a skip. Callers index this buffer by `key_index * 4`, so
-            // dropping 64 bytes mid-stream slides every later key's binding onto the
-            // wrong key — and it still looks like a successful read.
-            let resp = self.transport.query_raw(
+            // `?`, never a skip, and a length-checked page. Callers index this buffer
+            // by `key_index * 4`, so dropping — or shortening — 64 bytes mid-stream
+            // slides every later key's binding onto the wrong key, and it still looks
+            // like a successful read.
+            let resp = self.transport.query_page(
                 self.commands.get_keymatrix,
                 query.as_bytes(),
                 ChecksumType::Bit7,
+                INPUT_REPORT_SIZE,
             )?;
             all_data.extend_from_slice(&resp);
         }
@@ -1595,9 +1605,12 @@ impl KeyboardInterface {
                 page: page as u8,
             };
             // Same offset hazard as `get_keymatrix`.
-            let resp =
-                self.transport
-                    .query_raw(cmd::GET_FN, query.as_bytes(), ChecksumType::Bit7)?;
+            let resp = self.transport.query_page(
+                cmd::GET_FN,
+                query.as_bytes(),
+                ChecksumType::Bit7,
+                INPUT_REPORT_SIZE,
+            )?;
             all_data.extend_from_slice(&resp);
         }
 
@@ -1789,9 +1802,12 @@ impl KeyboardInterface {
 
             // A skipped page shifts the rest of the macro, and the shifted bytes then
             // parse as a plausible-but-wrong keystroke sequence — so propagate.
-            let resp =
-                self.transport
-                    .query_raw(cmd::GET_MACRO, query.as_bytes(), ChecksumType::Bit7)?;
+            let resp = self.transport.query_page(
+                cmd::GET_MACRO,
+                query.as_bytes(),
+                ChecksumType::Bit7,
+                INPUT_REPORT_SIZE,
+            )?;
 
             // Skip command echo if present (some transports may add it)
             let start = if !resp.is_empty() && resp[0] == cmd::GET_MACRO {

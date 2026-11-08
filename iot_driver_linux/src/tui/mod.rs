@@ -96,6 +96,10 @@ struct App {
     // Remap tab state (tab 5)
     // Key Mapping tab state (unified per-key view)
     key_rows: Vec<KeyRow>,
+    /// Which table an in-flight key-mapping load is on, for the progress bar
+    key_rows_progress: Option<crate::keymap::LoadStage>,
+    /// Page counter when the current key-mapping load started
+    key_rows_pages_start: u64,
     key_mapping_selected: usize,
     key_mapping_view: KeyMappingView,
     key_mapping_sort: KmSort,
@@ -185,6 +189,8 @@ impl App {
         let persisted = crate::settings::Settings::load();
         let app = Self {
             device_selector,
+            key_rows_progress: None,
+            key_rows_pages_start: 0,
             info: FirmwareSettings::default(),
             tab: 0,
             selected: 0,
@@ -666,9 +672,14 @@ impl App {
             return;
         };
         self.loading.key_mapping = LoadState::Loading;
+        // Baseline for the per-page counter the progress bar interpolates with.
+        self.key_rows_pages_start = keyboard.pages_read();
+        self.key_rows_progress = None;
         let tx = self.gen_sender();
         tokio::spawn(async move {
-            match keymap::load_key_rows(&keyboard, None) {
+            let stage_tx = tx.clone();
+            let on_stage = move |s| stage_tx.send(AsyncResult::KeyRowsStage(s));
+            match keymap::load_key_rows(&keyboard, None, &on_stage) {
                 Ok(rows) => tx.send(AsyncResult::KeyRows(Ok(rows))),
                 Err(e) => tx.send(AsyncResult::KeyRows(Err(e.to_string()))),
             }
@@ -815,7 +826,11 @@ impl App {
                 self.loading.options = LoadState::Error;
                 self.status_msg = "Failed to load options".to_string();
             }
+            AsyncResult::KeyRowsStage(stage) => {
+                self.key_rows_progress = Some(stage);
+            }
             AsyncResult::KeyRows(Ok(rows)) => {
+                self.key_rows_progress = None;
                 self.key_rows = rows;
                 self.loading.key_mapping = LoadState::Loaded;
                 if self.key_mapping_selected >= self.key_rows.len() {
@@ -824,6 +839,7 @@ impl App {
                 self.status_msg = format!("{} keys loaded", self.key_rows.len());
             }
             AsyncResult::KeyRows(Err(e)) => {
+                self.key_rows_progress = None;
                 self.loading.key_mapping = LoadState::Error;
                 self.status_msg = format!("Failed to load key mapping: {e}");
             }
@@ -1385,6 +1401,7 @@ pub async fn run(device_selector: Option<String>) -> io::Result<()> {
                                     InfoTag::SideGreen => { let g = RGB_SPINNER.decrement_u8(app.info.side_g, coarse); app.set_side_color(app.info.side_r, g, app.info.side_b); }
                                     InfoTag::SideBlue => { let b = RGB_SPINNER.decrement_u8(app.info.side_b, coarse); app.set_side_color(app.info.side_r, app.info.side_g, b); }
                                     InfoTag::SideDazzle => app.toggle_side_dazzle(),
+                                    InfoTag::OsMode => { if let Some(ref opts) = app.options.clone() { app.set_os_mode(OS_MODE_SPINNER.decrement_u8(opts.os_mode, coarse)); } }
                                     InfoTag::FnLayer => { if let Some(ref opts) = app.options.clone() { app.set_fn_layer(FN_LAYER_SPINNER.decrement_u8(opts.fn_layer, coarse)); } }
                                     InfoTag::WasdSwap => app.toggle_wasd_swap(),
                                     InfoTag::AntiMistouch => app.toggle_anti_mistouch(),
@@ -1452,6 +1469,7 @@ pub async fn run(device_selector: Option<String>) -> io::Result<()> {
                                     InfoTag::SideGreen => { let g = RGB_SPINNER.increment_u8(app.info.side_g, coarse); app.set_side_color(app.info.side_r, g, app.info.side_b); }
                                     InfoTag::SideBlue => { let b = RGB_SPINNER.increment_u8(app.info.side_b, coarse); app.set_side_color(app.info.side_r, app.info.side_g, b); }
                                     InfoTag::SideDazzle => app.toggle_side_dazzle(),
+                                    InfoTag::OsMode => { if let Some(ref opts) = app.options.clone() { app.set_os_mode(OS_MODE_SPINNER.increment_u8(opts.os_mode, coarse)); } }
                                     InfoTag::FnLayer => { if let Some(ref opts) = app.options.clone() { app.set_fn_layer(FN_LAYER_SPINNER.increment_u8(opts.fn_layer, coarse)); } }
                                     InfoTag::WasdSwap => app.toggle_wasd_swap(),
                                     InfoTag::AntiMistouch => app.toggle_anti_mistouch(),

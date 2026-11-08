@@ -947,6 +947,11 @@ pub struct CommandTable {
     /// layer and OS the board reports in `GET_KBOPTION`. True on RY5088, whose
     /// single-key `SET_FN` keeps only the most recent edit.
     pub fn_table_write: bool,
+    /// Userpic slot upload/download. YiChip boards reuse the same command bytes
+    /// with a different page header (no slot byte, a length field instead) that
+    /// this driver does not implement, so they get `None`.
+    pub set_userpic: Option<u8>,
+    pub get_userpic: Option<u8>,
 }
 
 pub static RY5088_COMMANDS: CommandTable = CommandTable {
@@ -965,6 +970,8 @@ pub static RY5088_COMMANDS: CommandTable = CommandTable {
     get_kboption: Some(0x89),
     get_sleeptime: Some(0x91),
     fn_table_write: true,
+    set_userpic: Some(cmd::SET_USERPIC),
+    get_userpic: Some(cmd::GET_USERPIC),
 };
 
 pub static YICHIP_COMMANDS: CommandTable = CommandTable {
@@ -983,6 +990,8 @@ pub static YICHIP_COMMANDS: CommandTable = CommandTable {
     get_kboption: Some(0x86),
     get_sleeptime: None,
     fn_table_write: false,
+    set_userpic: None,
+    get_userpic: None,
 };
 
 impl ProtocolFamily {

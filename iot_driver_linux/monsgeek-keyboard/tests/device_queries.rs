@@ -311,6 +311,17 @@ fn macro_read_existing() {
     }
 }
 
+/// One 56-byte SET_MACRO page: repeat once, press and release `keycode` with 10 ms delays.
+fn single_tap_macro(keycode: u8) -> Vec<u8> {
+    let mut data = vec![
+        0x01, 0x00, // repeat count (LE)
+        keycode, 0x8A, // down + 10ms delay
+        keycode, 0x0A, // up + 10ms delay
+    ];
+    data.resize(56, 0);
+    data
+}
+
 /// Test SET_MACRO round-trip at the raw transport level.
 ///
 /// Sends SET_MACRO for slot 7, waits, then reads it back with GET_MACRO.
@@ -321,19 +332,7 @@ fn macro_set_and_readback() {
 
     eprintln!("--- SET_MACRO raw test for slot 7 ---");
 
-    // Build a minimal macro: repeat=1, one keystroke 'a' down+up
-    let mut macro_data = vec![
-        0x01, // repeat count low
-        0x00, // repeat count high
-        0x04, // 'a' keycode
-        0x8A, // down + 10ms delay
-        0x04, // 'a' keycode
-        0x0A, // up + 10ms delay
-    ];
-    // Pad to 56 bytes
-    while macro_data.len() < 56 {
-        macro_data.push(0);
-    }
+    let macro_data = single_tap_macro(0x04); // 'a'
 
     // Page 0, is_last=1
     let mut cmd_data = vec![7u8, 0, 56, 1, 0, 0, 0];
@@ -424,17 +423,7 @@ fn macro_set_and_readback() {
     }
 
     // Write to slot 0
-    let mut macro_data_0 = vec![
-        0x01, // repeat count low
-        0x00, // repeat count high
-        0x17, // 't' keycode
-        0x8A, // down + 10ms delay
-        0x17, // 't' keycode
-        0x0A, // up + 10ms delay
-    ];
-    while macro_data_0.len() < 56 {
-        macro_data_0.push(0);
-    }
+    let macro_data_0 = single_tap_macro(0x17); // 't'
 
     let mut cmd_data_0 = vec![0u8, 0, 56, 1, 0, 0, 0];
     cmd_data_0.extend_from_slice(&macro_data_0);
